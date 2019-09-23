@@ -14,6 +14,7 @@
 package syncer
 
 import (
+	"github.com/pingcap/dm/pkg/schema"
 	"math"
 	"strconv"
 
@@ -54,13 +55,13 @@ func (s *testSyncerSuite) TestGenColumnPlaceholders(c *C) {
 }
 
 func (s *testSyncerSuite) TestGenColumnList(c *C) {
-	columns := []*column{
+	columns := []*schema.Column{
 		{
-			name: "a",
+			Name: "a",
 		}, {
-			name: "b",
+			Name: "b",
 		}, {
-			name: "c",
+			Name: "c",
 		},
 	}
 
@@ -72,41 +73,41 @@ func (s *testSyncerSuite) TestGenColumnList(c *C) {
 }
 
 func (s *testSyncerSuite) TestFindFitIndex(c *C) {
-	pkColumns := []*column{
+	pkColumns := []*schema.Column{
 		{
-			name: "a",
+			Name: "a",
 		}, {
-			name: "b",
+			Name: "b",
 		},
 	}
-	indexColumns := []*column{
+	indexColumns := []*schema.Column{
 		{
-			name: "c",
+			Name: "c",
 		},
 	}
-	indexColumnsNotNull := []*column{
+	indexColumnsNotNull := []*schema.Column{
 		{
-			name:    "d",
+			Name:    "d",
 			NotNull: true,
 		},
 	}
 
-	columns := findFitIndex(map[string][]*column{
+	columns := findFitIndex(map[string][]*schema.Column{
 		"primary": pkColumns,
 		"index":   indexColumns,
 	})
 	c.Assert(columns, HasLen, 2)
-	c.Assert(columns[0].name, Equals, "a")
-	c.Assert(columns[1].name, Equals, "b")
+	c.Assert(columns[0].Name, Equals, "a")
+	c.Assert(columns[1].Name, Equals, "b")
 
-	columns = findFitIndex(map[string][]*column{
+	columns = findFitIndex(map[string][]*schema.Column{
 		"index": indexColumns,
 	})
 	c.Assert(columns, HasLen, 0)
 
-	columns = findFitIndex(map[string][]*column{
+	columns = findFitIndex(map[string][]*schema.Column{
 		"index": indexColumnsNotNull,
 	})
 	c.Assert(columns, HasLen, 1)
-	c.Assert(columns[0].name, Equals, "d")
+	c.Assert(columns[0].Name, Equals, "d")
 }

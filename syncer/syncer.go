@@ -45,6 +45,7 @@ import (
 	fr "github.com/pingcap/dm/pkg/func-rollback"
 	"github.com/pingcap/dm/pkg/gtid"
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/schema"
 	"github.com/pingcap/dm/pkg/streamer"
 	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/pkg/tracing"
@@ -143,8 +144,8 @@ type Syncer struct {
 	wg    sync.WaitGroup
 	jobWg sync.WaitGroup
 
-	tables       map[string]*table   // table cache: `target-schema`.`target-table` -> table
-	cacheColumns map[string][]string // table columns cache: `target-schema`.`target-table` -> column names list
+	tables       map[string]*schema.Table // table cache: `target-schema`.`target-table` -> table
+	cacheColumns map[string][]string      // table columns cache: `target-schema`.`target-table` -> column names list
 	genColsCache *GenColCache
 
 	fromDB *UpStreamConn
@@ -153,6 +154,7 @@ type Syncer struct {
 	toDBConns []*DBConn
 	ddlDB     *conn.BaseDB
 	ddlDBConn *DBConn
+	tracker   *schema.Tracker
 
 	jobs               []chan *job
 	jobsClosed         sync2.AtomicBool
@@ -226,7 +228,7 @@ func NewSyncer(cfg *config.SubTaskConfig) *Syncer {
 	syncer.binlogSizeCount.Set(0)
 	syncer.lastCount.Set(0)
 	syncer.count.Set(0)
-	syncer.tables = make(map[string]*table)
+	syncer.tables = make(map[string]*schema.Table)
 	syncer.cacheColumns = make(map[string][]string)
 	syncer.genColsCache = NewGenColCache()
 	syncer.c = newCausality()
@@ -380,6 +382,12 @@ func (s *Syncer) Init() (err error) {
 	if err != nil {
 		return err
 	}
+
+	s.tracker, err = schema.NewTracker(s.checkpoint.GlobalPoint(), s.fromDB.BaseDB.DB, s.ddlDB.DB, s.bwList, s.tableRouter)
+	if err != nil {
+		return err
+	}
+
 	if s.cfg.EnableHeartbeat {
 		s.heartbeat, err = GetHeartbeat(&HeartbeatConfig{
 			serverID:       s.cfg.ServerID,
@@ -643,35 +651,25 @@ func (s *Syncer) clearTables(schema, table string) {
 }
 
 func (s *Syncer) clearAllTables() {
-	s.tables = make(map[string]*table)
+	s.tables = make(map[string]*schema.Table)
 	s.cacheColumns = make(map[string][]string)
 	s.genColsCache.reset()
 }
 
-func (s *Syncer) getTableFromDB(db *DBConn, schema string, name string) (*table, error) {
-	table := &table{}
-	table.schema = schema
-	table.name = name
-	table.indexColumns = make(map[string][]*column)
-
-	err := getTableColumns(s.tctx, db, table)
+func (s *Syncer) getTableFromTracker(db string, table string) (*schema.Table, error) {
+	tableDef, err := s.tracker.GetTable(s.tctx, db, table)
 	if err != nil {
 		return nil, err
 	}
 
-	err = getTableIndex(s.tctx, db, table)
-	if err != nil {
-		return nil, err
+	if len(tableDef.Columns) == 0 {
+		return nil, terror.ErrSyncerUnitGetTableFromDB.Generate(db, table)
 	}
 
-	if len(table.columns) == 0 {
-		return nil, terror.ErrSyncerUnitGetTableFromDB.Generate(schema, name)
-	}
-
-	return table, nil
+	return tableDef, nil
 }
 
-func (s *Syncer) getTable(schema string, table string) (*table, []string, error) {
+func (s *Syncer) getTable(schema string, table string) (*schema.Table, []string, error) {
 	key := dbutil.TableName(schema, table)
 
 	value, ok := s.tables[key]
@@ -679,15 +677,15 @@ func (s *Syncer) getTable(schema string, table string) (*table, []string, error)
 		return value, s.cacheColumns[key], nil
 	}
 
-	t, err := s.getTableFromDB(s.ddlDBConn, schema, table)
+	t, err := s.getTableFromTracker(schema, table)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// compute cache column list for column mapping
-	columns := make([]string, 0, len(t.columns))
-	for _, c := range t.columns {
-		columns = append(columns, c.name)
+	columns := make([]string, 0, len(t.Columns))
+	for _, c := range t.Columns {
+		columns = append(columns, c.Name)
 	}
 
 	s.tables[key] = t
@@ -1443,7 +1441,7 @@ func (s *Syncer) handleRowsEvent(ev *replication.RowsEvent, ec eventContext) err
 	if err != nil {
 		return err
 	}
-	prunedColumns, prunedRows, err := pruneGeneratedColumnDML(table.columns, rows, schemaName, tableName, s.genColsCache)
+	prunedColumns, prunedRows, err := pruneGeneratedColumnDML(table.Columns, rows, schemaName, tableName, s.genColsCache)
 	if err != nil {
 		return err
 	}
@@ -1463,13 +1461,13 @@ func (s *Syncer) handleRowsEvent(ev *replication.RowsEvent, ec eventContext) err
 		return err
 	}
 	param := &genDMLParam{
-		schema:               table.schema,
-		table:                table.name,
+		schema:               table.Schema,
+		table:                table.Name,
 		data:                 prunedRows,
 		originalData:         rows,
 		columns:              prunedColumns,
-		originalColumns:      table.columns,
-		originalIndexColumns: table.indexColumns,
+		originalColumns:      table.Columns,
+		originalIndexColumns: table.IndexColumns,
 	}
 
 	switch ec.header.EventType {
@@ -1478,7 +1476,7 @@ func (s *Syncer) handleRowsEvent(ev *replication.RowsEvent, ec eventContext) err
 			param.safeMode = ec.safeMode.Enable()
 			sqls, keys, args, err = genInsertSQLs(param)
 			if err != nil {
-				return terror.Annotatef(err, "gen insert sqls failed, schema: %s, table: %s", table.schema, table.name)
+				return terror.Annotatef(err, "gen insert sqls failed, schema: %s, table: %s", table.Schema, table.Name)
 			}
 		}
 		binlogEvent.WithLabelValues("write_rows", s.cfg.Name).Observe(time.Since(ec.startTime).Seconds())
@@ -1489,7 +1487,7 @@ func (s *Syncer) handleRowsEvent(ev *replication.RowsEvent, ec eventContext) err
 			param.safeMode = ec.safeMode.Enable()
 			sqls, keys, args, err = genUpdateSQLs(param)
 			if err != nil {
-				return terror.Annotatef(err, "gen update sqls failed, schema: %s, table: %s", table.schema, table.name)
+				return terror.Annotatef(err, "gen update sqls failed, schema: %s, table: %s", table.Schema, table.Name)
 			}
 		}
 		binlogEvent.WithLabelValues("update_rows", s.cfg.Name).Observe(time.Since(ec.startTime).Seconds())
@@ -1499,7 +1497,7 @@ func (s *Syncer) handleRowsEvent(ev *replication.RowsEvent, ec eventContext) err
 		if !applied {
 			sqls, keys, args, err = genDeleteSQLs(param)
 			if err != nil {
-				return terror.Annotatef(err, "gen delete sqls failed, schema: %s, table: %s", table.schema, table.name)
+				return terror.Annotatef(err, "gen delete sqls failed, schema: %s, table: %s", table.Schema, table.Name)
 			}
 		}
 		binlogEvent.WithLabelValues("delete_rows", s.cfg.Name).Observe(time.Since(ec.startTime).Seconds())
@@ -1527,7 +1525,7 @@ func (s *Syncer) handleRowsEvent(ev *replication.RowsEvent, ec eventContext) err
 		if keys != nil {
 			key = keys[i]
 		}
-		err = s.commitJob(*ec.latestOp, originSchema, originTable, table.schema, table.name, sqls[i], arg, key, true, *ec.lastPos, *ec.currentPos, nil, *ec.traceID)
+		err = s.commitJob(*ec.latestOp, originSchema, originTable, table.Schema, table.Name, sqls[i], arg, key, true, *ec.lastPos, *ec.currentPos, nil, *ec.traceID)
 		if err != nil {
 			return err
 		}
