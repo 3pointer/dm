@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/schema"
 	"github.com/pingcap/dm/pkg/terror"
 
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
@@ -40,7 +41,7 @@ type GenColCache struct {
 	hasGenColumn map[string]bool
 
 	// `schema`.`table` -> column list
-	columns map[string][]*column
+	columns map[string][]*schema.Column
 
 	// `schema`.`table` -> a bool slice representing whether it is generated for each column
 	isGenColumn map[string][]bool
@@ -50,12 +51,12 @@ type GenColCache struct {
 type genDMLParam struct {
 	schema               string
 	table                string
-	safeMode             bool                 // only used in update
-	data                 [][]interface{}      // pruned data
-	originalData         [][]interface{}      // all data
-	columns              []*column            // pruned columns
-	originalColumns      []*column            // all columns
-	originalIndexColumns map[string][]*column // all index information
+	safeMode             bool                        // only used in update
+	data                 [][]interface{}             // pruned data
+	originalData         [][]interface{}             // all data
+	columns              []*schema.Column            // pruned columns
+	originalColumns      []*schema.Column            // all columns
+	originalIndexColumns map[string][]*schema.Column // all index information
 }
 
 // NewGenColCache creates a GenColCache.
@@ -88,14 +89,14 @@ func (c *GenColCache) clearTable(schema, table string) {
 
 func (c *GenColCache) reset() {
 	c.hasGenColumn = make(map[string]bool)
-	c.columns = make(map[string][]*column)
+	c.columns = make(map[string][]*schema.Column)
 	c.isGenColumn = make(map[string][]bool)
 }
 
-func extractValueFromData(data []interface{}, columns []*column) []interface{} {
+func extractValueFromData(data []interface{}, columns []*schema.Column) []interface{} {
 	value := make([]interface{}, 0, len(data))
 	for i := range data {
-		value = append(value, castUnsigned(data[i], columns[i].unsigned, columns[i].tp))
+		value = append(value, castUnsigned(data[i], columns[i].Unsigned, columns[i].Tp))
 	}
 	return value
 }
@@ -148,7 +149,7 @@ func genInsertSQLs(param *genDMLParam) ([]string, [][]string, [][]interface{}, e
 
 func genUpdateSQLs(param *genDMLParam) ([]string, [][]string, [][]interface{}, error) {
 	var (
-		schema               = param.schema
+		db                   = param.schema
 		table                = param.table
 		safeMode             = param.safeMode
 		data                 = param.data
@@ -199,19 +200,19 @@ func genUpdateSQLs(param *genDMLParam) ([]string, [][]string, [][]interface{}, e
 
 		if safeMode {
 			// generate delete sql from old data
-			sql, value := genDeleteSQL(schema, table, oriOldValues, originalColumns, defaultIndexColumns)
+			sql, value := genDeleteSQL(db, table, oriOldValues, originalColumns, defaultIndexColumns)
 			sqls = append(sqls, sql)
 			values = append(values, value)
 			keys = append(keys, ks)
 			// generate replace sql from new data
-			sql = fmt.Sprintf("REPLACE INTO `%s`.`%s` (%s) VALUES (%s);", schema, table, columnList, columnPlaceholders)
+			sql = fmt.Sprintf("REPLACE INTO `%s`.`%s` (%s) VALUES (%s);", db, table, columnList, columnPlaceholders)
 			sqls = append(sqls, sql)
 			values = append(values, changedValues)
 			keys = append(keys, ks)
 			continue
 		}
 
-		updateColumns := make([]*column, 0, len(defaultIndexColumns))
+		updateColumns := make([]*schema.Column, 0, len(defaultIndexColumns))
 		updateValues := make([]interface{}, 0, len(defaultIndexColumns))
 		for j := range oldValues {
 			updateColumns = append(updateColumns, columns[j])
@@ -235,7 +236,7 @@ func genUpdateSQLs(param *genDMLParam) ([]string, [][]string, [][]interface{}, e
 		where := genWhere(whereColumns, whereValues)
 		value = append(value, whereValues...)
 
-		sql := fmt.Sprintf("UPDATE `%s`.`%s` SET %s WHERE %s LIMIT 1;", schema, table, kvs, where)
+		sql := fmt.Sprintf("UPDATE `%s`.`%s` SET %s WHERE %s LIMIT 1;", db, table, kvs, where)
 		sqls = append(sqls, sql)
 		values = append(values, value)
 		keys = append(keys, ks)
@@ -278,7 +279,7 @@ func genDeleteSQLs(param *genDMLParam) ([]string, [][]string, [][]interface{}, e
 	return sqls, keys, values, nil
 }
 
-func genDeleteSQL(schema string, table string, value []interface{}, columns []*column, indexColumns []*column) (string, []interface{}) {
+func genDeleteSQL(schema string, table string, value []interface{}, columns []*schema.Column, indexColumns []*schema.Column) (string, []interface{}) {
 	whereColumns, whereValues := columns, value
 	if len(indexColumns) > 0 {
 		whereColumns, whereValues = getColumnData(columns, indexColumns, value)
@@ -290,13 +291,13 @@ func genDeleteSQL(schema string, table string, value []interface{}, columns []*c
 	return sql, whereValues
 }
 
-func genColumnList(columns []*column) string {
+func genColumnList(columns []*schema.Column) string {
 	var buf strings.Builder
 	for i, column := range columns {
 		if i != len(columns)-1 {
-			buf.WriteString("`" + column.name + "`,")
+			buf.WriteString("`" + column.Name + "`,")
 		} else {
-			buf.WriteString("`" + column.name + "`")
+			buf.WriteString("`" + column.Name + "`")
 		}
 	}
 
@@ -386,43 +387,16 @@ func columnValue(value interface{}, unsigned bool, tp string) string {
 	return data
 }
 
-func findColumn(columns []*column, indexColumn string) *column {
-	for _, column := range columns {
-		if column.name == indexColumn {
-			return column
-		}
-	}
-
-	return nil
-}
-
-func findColumns(columns []*column, indexColumns map[string][]string) map[string][]*column {
-	result := make(map[string][]*column)
-
-	for keyName, indexCols := range indexColumns {
-		cols := make([]*column, 0, len(indexCols))
-		for _, name := range indexCols {
-			column := findColumn(columns, name)
-			if column != nil {
-				cols = append(cols, column)
-			}
-		}
-		result[keyName] = cols
-	}
-
-	return result
-}
-
-func genKeyList(columns []*column, dataSeq []interface{}) string {
+func genKeyList(columns []*schema.Column, dataSeq []interface{}) string {
 	values := make([]string, 0, len(dataSeq))
 	for i, data := range dataSeq {
-		values = append(values, columnValue(data, columns[i].unsigned, columns[i].tp))
+		values = append(values, columnValue(data, columns[i].Unsigned, columns[i].Tp))
 	}
 
 	return strings.Join(values, ",")
 }
 
-func genMultipleKeys(columns []*column, value []interface{}, indexColumns map[string][]*column) []string {
+func genMultipleKeys(columns []*schema.Column, value []interface{}, indexColumns map[string][]*schema.Column) []string {
 	multipleKeys := make([]string, 0, len(indexColumns))
 	for _, indexCols := range indexColumns {
 		cols, vals := getColumnData(columns, indexCols, value)
@@ -431,7 +405,7 @@ func genMultipleKeys(columns []*column, value []interface{}, indexColumns map[st
 	return multipleKeys
 }
 
-func findFitIndex(indexColumns map[string][]*column) []*column {
+func findFitIndex(indexColumns map[string][]*schema.Column) []*schema.Column {
 	cols, ok := indexColumns["primary"]
 	if ok {
 		if len(cols) == 0 {
@@ -442,22 +416,22 @@ func findFitIndex(indexColumns map[string][]*column) []*column {
 	}
 
 	// second find not null unique key
-	fn := func(c *column) bool {
+	fn := func(c *schema.Column) bool {
 		return !c.NotNull
 	}
 
 	return getSpecifiedIndexColumn(indexColumns, fn)
 }
 
-func getAvailableIndexColumn(indexColumns map[string][]*column, data []interface{}) []*column {
-	fn := func(c *column) bool {
-		return data[c.idx] == nil
+func getAvailableIndexColumn(indexColumns map[string][]*schema.Column, data []interface{}) []*schema.Column {
+	fn := func(c *schema.Column) bool {
+		return data[c.Idx] == nil
 	}
 
 	return getSpecifiedIndexColumn(indexColumns, fn)
 }
 
-func getSpecifiedIndexColumn(indexColumns map[string][]*column, fn func(col *column) bool) []*column {
+func getSpecifiedIndexColumn(indexColumns map[string][]*schema.Column, fn func(col *schema.Column) bool) []*schema.Column {
 	for _, indexCols := range indexColumns {
 		if len(indexCols) == 0 {
 			continue
@@ -479,18 +453,18 @@ func getSpecifiedIndexColumn(indexColumns map[string][]*column, fn func(col *col
 	return nil
 }
 
-func getColumnData(columns []*column, indexColumns []*column, data []interface{}) ([]*column, []interface{}) {
-	cols := make([]*column, 0, len(columns))
+func getColumnData(columns []*schema.Column, indexColumns []*schema.Column, data []interface{}) ([]*schema.Column, []interface{}) {
+	cols := make([]*schema.Column, 0, len(columns))
 	values := make([]interface{}, 0, len(columns))
 	for _, column := range indexColumns {
 		cols = append(cols, column)
-		values = append(values, data[column.idx])
+		values = append(values, data[column.Idx])
 	}
 
 	return cols, values
 }
 
-func genWhere(columns []*column, data []interface{}) string {
+func genWhere(columns []*schema.Column, data []interface{}) string {
 	var kvs bytes.Buffer
 	for i := range columns {
 		kvSplit := "="
@@ -499,22 +473,22 @@ func genWhere(columns []*column, data []interface{}) string {
 		}
 
 		if i == len(columns)-1 {
-			fmt.Fprintf(&kvs, "`%s` %s ?", columns[i].name, kvSplit)
+			fmt.Fprintf(&kvs, "`%s` %s ?", columns[i].Name, kvSplit)
 		} else {
-			fmt.Fprintf(&kvs, "`%s` %s ? AND ", columns[i].name, kvSplit)
+			fmt.Fprintf(&kvs, "`%s` %s ? AND ", columns[i].Name, kvSplit)
 		}
 	}
 
 	return kvs.String()
 }
 
-func genKVs(columns []*column) string {
+func genKVs(columns []*schema.Column) string {
 	var kvs bytes.Buffer
 	for i := range columns {
 		if i == len(columns)-1 {
-			fmt.Fprintf(&kvs, "`%s` = ?", columns[i].name)
+			fmt.Fprintf(&kvs, "`%s` = ?", columns[i].Name)
 		} else {
-			fmt.Fprintf(&kvs, "`%s` = ?, ", columns[i].name)
+			fmt.Fprintf(&kvs, "`%s` = ?, ", columns[i].Name)
 		}
 	}
 
@@ -542,9 +516,9 @@ func (s *Syncer) mappingDML(schema, table string, columns []string, data [][]int
 // generated column. because generated column is not support setting value
 // directly in DML, we must remove generated column from DML, including column
 // list and data list including generated columns.
-func pruneGeneratedColumnDML(columns []*column, data [][]interface{}, schema, table string, cache *GenColCache) ([]*column, [][]interface{}, error) {
+func pruneGeneratedColumnDML(columns []*schema.Column, data [][]interface{}, db, table string, cache *GenColCache) ([]*schema.Column, [][]interface{}, error) {
 	var (
-		cacheKey    = dbutil.TableName(schema, table)
+		cacheKey    = dbutil.TableName(db, table)
 		cacheStatus = cache.status(cacheKey)
 	)
 
@@ -580,11 +554,11 @@ func pruneGeneratedColumnDML(columns []*column, data [][]interface{}, schema, ta
 	)
 
 	for _, c := range columns {
-		isGenColumn := c.isGeneratedColumn()
+		isGenColumn := c.IsGeneratedColumn()
 		colIndexfilters = append(colIndexfilters, isGenColumn)
 		if isGenColumn {
 			needPrune = true
-			genColumnNames[c.name] = true
+			genColumnNames[c.Name] = true
 		}
 	}
 
@@ -594,7 +568,7 @@ func pruneGeneratedColumnDML(columns []*column, data [][]interface{}, schema, ta
 	}
 
 	var (
-		cols = make([]*column, 0, len(columns))
+		cols = make([]*schema.Column, 0, len(columns))
 		rows = make([][]interface{}, 0, len(data))
 	)
 

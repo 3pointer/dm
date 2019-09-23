@@ -15,8 +15,35 @@ package schema
 
 import (
 	"github.com/siddontang/go-mysql/mysql"
+
+	tcontext "github.com/pingcap/dm/pkg/context"
 )
 
-type SchemaTracker struct {
-	curPos mysql.Position
+// Tracker ...
+type Tracker struct {
+	curPos   mysql.Position
+	executor *DDLExecutor
+}
+
+// NewTracker ...
+func NewTracker() (*Tracker, error) {
+	executor, err := NewDDLExecutor()
+	if err != nil {
+		// TODO change err to terror
+		return nil, err
+	}
+	return &Tracker{
+		executor: executor,
+	}, nil
+
+}
+
+// GetTable ...
+func (t *Tracker) GetTable(tctx *tcontext.Context, db string, table string) (*Table, error) {
+	return t.executor.GetTable(tctx.Context(), db, table)
+}
+
+// Exec ...
+func (t *Tracker) Exec(tctx *tcontext.Context, db string, sql string, pos mysql.Position) error {
+	return t.executor.Execute(tctx.Context(), sql)
 }

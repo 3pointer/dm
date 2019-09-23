@@ -963,16 +963,16 @@ func (s *testSyncerSuite) TestGeneratedColumn(c *C) {
 					args [][]interface{}
 				)
 
-				prunedColumns, prunedRows, err := pruneGeneratedColumnDML(table.columns, ev.Rows, table.schema, table.name, syncer.genColsCache)
+				prunedColumns, prunedRows, err := pruneGeneratedColumnDML(table.Columns, ev.Rows, table.Schema, table.Name, syncer.genColsCache)
 				c.Assert(err, IsNil)
 				param := &genDMLParam{
-					schema:               table.schema,
-					table:                table.name,
+					schema:               table.Schema,
+					table:                table.Name,
 					data:                 prunedRows,
 					originalData:         ev.Rows,
 					columns:              prunedColumns,
-					originalColumns:      table.columns,
-					originalIndexColumns: table.indexColumns,
+					originalColumns:      table.Columns,
+					originalIndexColumns: table.IndexColumns,
 				}
 				switch e.Header.EventType {
 				case replication.WRITE_ROWS_EVENTv0, replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2:
