@@ -25,6 +25,8 @@ import (
 // DDLExecutor ...
 type DDLExecutor struct {
 	session session.Session
+
+	databases map[string]Database
 }
 
 // NewDDLExecutor represents a mock tidb session use memory to store data
@@ -139,4 +141,9 @@ func (e *DDLExecutor) GetTable(ctx context.Context, schema string, name string) 
 	table.IndexColumns = findColumns(table.Columns, columns)
 
 	return nil, nil
+}
+
+func (e *DDLExecutor) restore(snapshot map[string]Database) error {
+	e.databases = snapshot
+	return nil
 }

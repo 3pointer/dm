@@ -374,6 +374,12 @@ func (s *Syncer) Init() (err error) {
 	if err != nil {
 		return err
 	}
+
+	s.tracker, err = schema.NewTracker(s.checkpoint.GlobalPoint(), s.fromDB.baseConn.DB, s.ddlDB.baseConn.DB, s.bwList, s.tableRouter)
+	if err != nil {
+		return err
+	}
+
 	if s.cfg.EnableHeartbeat {
 		s.heartbeat, err = GetHeartbeat(&HeartbeatConfig{
 			serverID:       s.cfg.ServerID,
