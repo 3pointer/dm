@@ -13,19 +13,23 @@
 
 package schema
 
-import "github.com/siddontang/go-mysql/mysql"
+import (
+	"database/sql"
+	"github.com/siddontang/go-mysql/mysql"
+)
 
 type storage struct {
+	db *sql.DB
 }
 
-func newStorage() *storage {
-	return &storage{}
+func newStorage(db *sql.DB) *storage {
+	return &storage{db}
 }
 
-func (s *storage) saveSnapShot() {
-
+func (s *storage) saveSnapShot(snapshot SnapShot, pos mysql.Position) error {
+	return nil
 }
 
-func (s *storage) loadSnapShot(pos mysql.Position) (map[string]Database, error) {
+func (s *storage) loadSnapShot(pos mysql.Position) (SnapShot, error) {
 	return nil, nil
 }

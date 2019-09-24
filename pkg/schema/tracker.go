@@ -14,7 +14,11 @@
 package schema
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	route "github.com/pingcap/tidb-tools/pkg/table-router"
@@ -26,7 +30,6 @@ import (
 
 // Tracker ...
 type Tracker struct {
-	curPos   mysql.Position
 	executor *DDLExecutor
 
 	storage *storage
@@ -38,7 +41,7 @@ func NewTracker(
 	pos mysql.Position, fromDB *sql.DB, toDB *sql.DB,
 	bwList *filter.Filter, tableRouter *route.Table) (*Tracker, error) {
 
-	storage := newStorage()
+	storage := newStorage(toDB)
 	currentPosSnapShot, err := storage.loadSnapShot(pos)
 	if err != nil {
 		return nil, err
@@ -61,7 +64,8 @@ func NewTracker(
 		return nil, err
 	}
 
-	err = executor.restore(snapshot)
+	ctx := context.Background()
+	err = executor.restore(ctx, snapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -73,26 +77,26 @@ func NewTracker(
 
 }
 
-func mergeSnapShot(currentPosSnapShot, DBSnapShot map[string]Database) map[string]Database {
-	for dbName, tables := range currentPosSnapShot {
+func mergeSnapShot(currentPosSnapShot, DBSnapShot SnapShot) SnapShot {
+	for dbName, db := range currentPosSnapShot {
 		if _, ok := DBSnapShot[dbName]; !ok {
 			delete(currentPosSnapShot, dbName)
 		} else {
-			DBTables := DBSnapShot[dbName]
-			for tableName := range tables {
+			DBTables := DBSnapShot[dbName].Tables
+			for tableName := range db.Tables {
 				if _, ok := DBTables[tableName]; !ok {
-					delete(currentPosSnapShot[dbName], tableName)
+					delete(currentPosSnapShot[dbName].Tables, tableName)
 				}
 			}
 		}
 	}
 
-	for dbName, tables := range DBSnapShot {
+	for dbName, db := range DBSnapShot {
 		if _, ok := currentPosSnapShot[dbName]; !ok {
-			currentPosSnapShot[dbName] = tables
+			currentPosSnapShot[dbName] = db
 		} else {
-			posTables := currentPosSnapShot[dbName]
-			for tableName, table := range tables {
+			posTables := currentPosSnapShot[dbName].Tables
+			for tableName, table := range db.Tables {
 				if _, ok := posTables[tableName]; !ok {
 					posTables[tableName] = table
 				}
@@ -103,38 +107,69 @@ func mergeSnapShot(currentPosSnapShot, DBSnapShot map[string]Database) map[strin
 	return currentPosSnapShot
 }
 
-func fetchSnapShotFromDB(fromDB *sql.DB, toDB *sql.DB, bwList *filter.Filter, router *route.Table) (map[string]Database, error) {
+func fetchSnapShotFromDB(fromDB *sql.DB, toDB *sql.DB, bwList *filter.Filter, router *route.Table) (SnapShot, error) {
 	targetTablesMap, err := utils.FetchTargetDoTables(fromDB, bwList, router)
 	if err != nil {
 		return nil, err
 	}
-	dbs := make(map[string]Database)
-	for targetTable, sourceTables := range targetTablesMap {
+	snapshot := make(SnapShot)
+	for targetTableSchema, sourceTables := range targetTablesMap {
+		keys := strings.Split(targetTableSchema, ".")
+		if len(keys) != 2 {
+			return nil, errors.New("targetTablesMap key errror")
+		}
+		targetSchema := keys[0]
+		targetTable := keys[1]
+
+		dbQuery := fmt.Sprintf(showCreateDBSQL, targetSchema)
+		createDBSQL, err := getCreateSQL(toDB, dbQuery)
+		if err != nil {
+			return nil, err
+		}
+		tableQuery := fmt.Sprintf(showCreateTableSQL, targetSchema, targetTable)
+		createTableSQL, err := getCreateSQL(toDB, tableQuery)
+		if err != nil {
+			return nil, err
+		}
+
 		// use downstream table schema as upstream table schema
 		// because in incremental mode, upstream schema may different from current checkpoint's schema
 		// but downstream schema is same as current checkpoint's schema
-		table, err := getTableColumns(toDB, targetTable)
-		if err != nil {
-			return nil, err
-		}
-		err = getTableIndex(toDB, table)
-		if err != nil {
-			return nil, err
-		}
 		for _, sourceTable := range sourceTables {
-			dbs[sourceTable.Schema][sourceTable.Name] = table
+			createDBSQL = strings.Replace(createDBSQL, fmt.Sprintf("DATABASE `%s`", targetSchema),
+				fmt.Sprintf("DATABASE `%s`", sourceTable.Schema), -1)
+
+			createTableSQL = strings.Replace(createTableSQL, fmt.Sprintf("TABLE `%s`", targetTable),
+				fmt.Sprintf("TABLE `%s`", sourceTable.Name), -1)
+
+			if _, ok := snapshot[sourceTable.Schema]; !ok {
+				snapshot[sourceTable.Schema] = Database{
+					CreateDBSQL: createDBSQL,
+					Tables:      make(map[string]string),
+				}
+			}
+			snapshot[sourceTable.Schema].Tables[sourceTable.Name] = createTableSQL
 		}
 	}
 
-	return dbs, nil
+	return snapshot, nil
 }
 
 // GetTable ...
 func (t *Tracker) GetTable(tctx *tcontext.Context, db string, table string) (*Table, error) {
-	return t.executor.GetTable(tctx.Context(), db, table)
+	return t.executor.getTable(tctx.Context(), db, table)
 }
 
 // Exec ...
 func (t *Tracker) Exec(tctx *tcontext.Context, db string, sql string, pos mysql.Position) error {
-	return t.executor.Execute(tctx.Context(), sql)
+	err := t.executor.execute(tctx.Context(), db, sql)
+	if err != nil {
+		return err
+	}
+	snapshot, err := t.executor.snapshot(tctx.Context())
+	err = t.storage.saveSnapShot(snapshot, pos)
+	if err != nil {
+		return err
+	}
+	return nil
 }

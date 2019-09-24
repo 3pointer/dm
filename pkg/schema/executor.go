@@ -26,7 +26,9 @@ import (
 type DDLExecutor struct {
 	session session.Session
 
-	databases map[string]Database
+	// FIXME: it's a bug, session tidb `show databases` only return 1 row
+	// so we have to record how many databases met before
+	databases map[string]bool
 }
 
 // NewDDLExecutor represents a mock tidb session use memory to store data
@@ -50,16 +52,18 @@ func NewDDLExecutor() (*DDLExecutor, error) {
 }
 
 // Execute executes the DDL
-func (e *DDLExecutor) Execute(ctx context.Context, sql string) error {
+func (e *DDLExecutor) execute(ctx context.Context, db, sql string) error {
 	_, err := e.session.Execute(ctx, sql)
 	if err != nil {
 		return err
 	}
+	if _, ok := e.databases[db]; !ok {
+		e.databases[db] = true
+	}
 	return nil
 }
 
-// GetTable ...
-func (e *DDLExecutor) GetTable(ctx context.Context, schema string, name string) (*Table, error) {
+func (e *DDLExecutor) getTable(ctx context.Context, schema string, name string) (*Table, error) {
 	table := &Table{}
 	table.Schema = schema
 	table.Name = name
@@ -143,7 +147,73 @@ func (e *DDLExecutor) GetTable(ctx context.Context, schema string, name string) 
 	return nil, nil
 }
 
-func (e *DDLExecutor) restore(snapshot map[string]Database) error {
-	e.databases = snapshot
+func (e *DDLExecutor) snapshot(ctx context.Context) (SnapShot, error) {
+	snapshot := make(SnapShot)
+	for db := range e.databases {
+		var createDBSQL string
+
+		recordSets, err := e.session.Execute(ctx, fmt.Sprintf(showCreateDBSQL, db))
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range recordSets {
+			chunkRows, err := session.GetRows4Test(ctx, e.session, row)
+			if err != nil {
+				return nil, err
+			}
+			for _, chunkRow := range chunkRows {
+				createDBSQL = chunkRow.GetString(1)
+			}
+		}
+		snapshot[db] = Database{
+			CreateDBSQL: createDBSQL,
+			Tables:      make(map[string]string),
+		}
+
+		_, err = e.session.Execute(ctx, fmt.Sprintf(useSQL, db))
+		if err != nil {
+			return nil, err
+		}
+		recordSets, err = e.session.Execute(ctx, showTableSQL)
+		tables := make([]string, 0)
+		for _, row := range recordSets {
+			chunkRows, err := session.GetRows4Test(ctx, e.session, row)
+			if err != nil {
+				return nil, err
+			}
+			for _, chunkRow := range chunkRows {
+				tables = append(tables, chunkRow.GetString(0))
+			}
+		}
+
+		for _, table := range tables {
+			recordSets, err = e.session.Execute(ctx, fmt.Sprintf(showCreateTableSQL, db, table))
+			for _, row := range recordSets {
+				chunkRows, err := session.GetRows4Test(ctx, e.session, row)
+				if err != nil {
+					return nil, err
+				}
+				for _, chunkRow := range chunkRows {
+					snapshot[db].Tables[table] = chunkRow.GetString(1)
+				}
+			}
+		}
+	}
+	return snapshot, nil
+}
+
+func (e *DDLExecutor) restore(ctx context.Context, snapshot SnapShot) error {
+	for _, db := range snapshot {
+		_, err := e.session.Execute(ctx, db.CreateDBSQL)
+		if err != nil {
+			return err
+		}
+		for _, tableSQL := range db.Tables {
+			_, err := e.session.Execute(ctx, tableSQL)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }

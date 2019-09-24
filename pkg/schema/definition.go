@@ -20,8 +20,23 @@ import (
 	"strings"
 )
 
+var (
+	useSQL             = "USE `%s`;"
+	showDBSQL          = "SHOW DATABASES;"
+	showTableSQL       = "SHOW TABLES;"
+	showCreateDBSQL    = "SHOW CREATE DATABASE %s;"
+	showCreateTableSQL = "SHOW CREATE TABLE `%s`.`%s`;"
+)
+
+// SnapShot ...
+type SnapShot map[string]Database
+
 // Database ...
-type Database map[string]*Table
+type Database struct {
+	CreateDBSQL string
+	// table Name -> create Table SQL
+	Tables map[string]string
+}
 
 // Column ...
 type Column struct {
@@ -40,8 +55,9 @@ func (c *Column) IsGeneratedColumn() bool {
 
 // Table ...
 type Table struct {
-	Schema string `json:"schema"`
-	Name   string `json:"name"`
+	CreateSQL string `json:"create_sql"`
+	Schema    string `json:"schema"`
+	Name      string `json:"name"`
 
 	Columns      []*Column            `json:"columns"`
 	IndexColumns map[string][]*Column `json:"index_columns"`
@@ -127,8 +143,8 @@ func getTableIndex(db *sql.DB, table *Table) error {
 	return nil
 }
 
-func getTableColumns(db *sql.DB, tableName string) (*Table, error) {
-	query := fmt.Sprintf("SHOW COLUMNS FROM %s", tableName)
+func getTableColumns(db *sql.DB, dbName string, tableName string) (*Table, error) {
+	query := fmt.Sprintf("SHOW COLUMNS FROM `%s`.`%s`", dbName, tableName)
 	rows, err := db.Query(query)
 	if err != nil {
 		return nil, terror.DBErrorAdapt(err, terror.ErrDBDriverError)
@@ -193,4 +209,14 @@ func getTableColumns(db *sql.DB, tableName string) (*Table, error) {
 	}
 
 	return table, nil
+}
+
+func getCreateSQL(db *sql.DB, sql string) (string, error) {
+	var unused interface{}
+	var createSQL string
+	err := db.QueryRow(sql).Scan(&unused, &createSQL)
+	if err != nil {
+		return "", err
+	}
+	return createSQL, nil
 }
